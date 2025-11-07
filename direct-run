@@ -1,0 +1,444 @@
+# ============================================
+# STEP 1: INSTALL REQUIRED PACKAGES
+# ============================================
+!pip install flask pyngrok scikit-learn pandas numpy joblib xgboost google-generativeai
+
+# ============================================
+# STEP 2: IMPORT LIBRARIES
+# ============================================
+import pandas as pd
+import numpy as np
+import joblib
+import os
+from flask import Flask, request, jsonify, render_template_string
+from pyngrok import ngrok
+import google.generativeai as genai
+
+print("✅ Libraries imported successfully!")
+
+# ============================================
+# STEP 3: CONFIGURE GEMINI API
+# ============================================
+# Get your API key from: https://makersuite.google.com/app/apikey
+GEMINI_API_KEY = "GEMINI API KEY HERE"  # Replace with your actual API key
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+print("✅ Gemini API configured!")
+
+# ============================================
+# STEP 4: LOAD DATASET TO GET SYMPTOM NAMES
+# ============================================
+DATASET_PATH = '/content/drive/MyDrive/dataset/Disease_and_symptoms_dataset.csv'
+
+try:
+    df = pd.read_csv(DATASET_PATH)
+    X = df.iloc[:, 1:]
+    valid_symptoms_raw = [s.strip() for s in X.columns]
+    valid_symptoms = [s.strip().lower().replace(" ", "_") for s in X.columns]
+    print(f"✅ Loaded {len(valid_symptoms)} symptom names from dataset")
+except Exception as e:
+    print(f"❌ Error loading dataset: {e}")
+    raise
+
+# ============================================
+# STEP 5: LOAD SAVED MODELS FROM DRIVE
+# ============================================
+MODEL_PATH_RF = '/content/drive/MyDrive/rf_model.pkl'
+MODEL_PATH_XGB = '/content/drive/MyDrive/xgb_model.pkl'
+ENCODER_PATH = '/content/drive/MyDrive/encoder.pkl'
+
+print("🔄 Loading models from Google Drive...")
+model_rf = joblib.load(MODEL_PATH_RF)
+model_xgb = joblib.load(MODEL_PATH_XGB)
+encoder = joblib.load(ENCODER_PATH)
+print("✅ All models loaded successfully!")
+
+def prettify(text):
+    return text.replace('_', ' ').title()
+
+# ============================================
+# STEP 6: PREDICTION FUNCTION
+# ============================================
+def predict_disease(symptom_list, use_ensemble=True):
+    data = [0] * len(valid_symptoms)
+    recognized, unrecognized = [], []
+    valid_symptom_map = dict(zip(valid_symptoms, valid_symptoms_raw))
+
+    for s in symptom_list:
+        s_clean = s.strip().lower().replace(" ", "_")
+        if s_clean in valid_symptoms:
+            idx = valid_symptoms.index(s_clean)
+            data[idx] = 1
+            recognized.append(valid_symptom_map[s_clean])
+        else:
+            unrecognized.append(s)
+
+    if len(recognized) < 2:
+        return [("⚠️ Please enter at least 2 valid symptoms", 0)], recognized, unrecognized
+
+    try:
+        df_in = pd.DataFrame([data], columns=valid_symptoms)
+
+        if use_ensemble:
+            probs_rf = model_rf.predict_proba(df_in)[0]
+            probs_xgb = model_xgb.predict_proba(df_in)[0]
+            probs = (probs_rf + probs_xgb) / 2
+        else:
+            probs = model_rf.predict_proba(df_in)[0]
+
+        diseases = encoder.inverse_transform(np.arange(len(probs)))
+        pretty_diseases = [prettify(d) for d in diseases]
+        top_idx = np.argsort(probs)[-5:][::-1]
+
+        results = [(pretty_diseases[i], probs[i] * 100) for i in top_idx]
+
+        confidence = probs[top_idx[0]]
+        if confidence < 0.25:
+            results.insert(0, ("⚠️ Low confidence - consider adding more symptoms", confidence * 100))
+
+        return results, recognized, unrecognized
+    except Exception as e:
+        return [(f"❌ Prediction error: {e}", 0)], recognized, unrecognized
+
+# ============================================
+# STEP 7: GEMINI CURE FUNCTION
+# ============================================
+def get_cure_from_gemini(disease_name):
+    """Get treatment/cure information from Gemini AI"""
+    try:
+        prompt = f"""You are a medical information assistant. Provide concise, evidence-based treatment information for the following disease: {disease_name}
+
+Please include:
+1. Common treatments (medications, therapies)
+2. Lifestyle changes and home remedies
+3. When to see a doctor
+4. Prevention tips
+
+Keep the response under 200 words and use bullet points for clarity.
+
+IMPORTANT: Add a disclaimer that this is for informational purposes only and not a substitute for professional medical advice."""
+
+        response = gemini_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Unable to fetch treatment information. Error: {str(e)}"
+
+# ============================================
+# STEP 8: FLASK WEB APP
+# ============================================
+app = Flask(__name__)
+
+home_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>🩺 AI Disease Predictor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      margin: 0;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 750px;
+      margin: auto;
+      background: white;
+      padding: 30px;
+      border-radius: 15px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+    h2 {
+      color: #667eea;
+      text-align: center;
+    }
+    input, button {
+      width: 100%;
+      padding: 12px;
+      margin: 10px 0;
+      border-radius: 8px;
+      border: 2px solid #ddd;
+      font-size: 16px;
+      box-sizing: border-box;
+    }
+    button {
+      border: none;
+      color: white;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .btn-primary {
+      background: #667eea;
+    }
+    .btn-primary:hover {
+      background: #5568d3;
+    }
+    .btn-danger {
+      background: #ff6b6b;
+    }
+    .btn-cure {
+      background: #28a745;
+      width: auto;
+      padding: 8px 15px;
+      font-size: 14px;
+      margin-left: 10px;
+    }
+    .btn-cure:hover {
+      background: #218838;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+    }
+    li {
+      padding: 12px;
+      background: #f0f4ff;
+      margin: 8px 0;
+      border-radius: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .remove-btn {
+      background: #ff6b6b;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 5px;
+      cursor: pointer;
+      color: white;
+    }
+    #suggestions {
+      border: 2px solid #667eea;
+      max-height: 180px;
+      overflow-y: auto;
+      display: none;
+      background: white;
+      border-radius: 8px;
+    }
+    #suggestions div {
+      padding: 10px;
+      cursor: pointer;
+      border-bottom: 1px solid #eee;
+    }
+    #suggestions div:hover {
+      background-color: #f0f4ff;
+    }
+    #output {
+      margin-top: 20px;
+    }
+    .disease-item {
+      background: white;
+      padding: 15px;
+      margin: 10px 0;
+      border-radius: 8px;
+      border-left: 4px solid #667eea;
+    }
+    .cure-section {
+      margin-top: 10px;
+      padding: 15px;
+      background: #f8f9fa;
+      border-radius: 6px;
+      display: none;
+      white-space: pre-wrap;
+      line-height: 1.6;
+    }
+    .spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      width: 20px;
+      height: 20px;
+      animation: spin 1s linear infinite;
+      display: inline-block;
+      margin-left: 10px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>🧠 AI Disease Predictor with Treatment Suggestions</h2>
+
+    <label for="symptom"><strong>🔍 Search & Select Symptoms:</strong></label>
+    <input type="text" id="symptom" onkeyup="filterSymptoms()" onkeypress="handleEnter(event)" placeholder="Type a symptom...">
+    <div id="suggestions"></div>
+
+    <button class="btn-primary" onclick="addSymptom()">➕ Add Symptom</button>
+    <button class="btn-danger" onclick="resetSymptoms()">🔄 Reset</button>
+
+    <h4>📋 Selected Symptoms (<span id="count">0</span>):</h4>
+    <ul id="selected"></ul>
+
+    <button class="btn-primary" onclick="predict()">🔮 Predict Disease</button>
+
+    <div id="output"></div>
+  </div>
+
+  <script>
+    const allSymptoms = {{symptom_list | safe}};
+    let selected = [];
+
+    function prettify(text) {
+      return text.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    function filterSymptoms() {
+      const input = document.getElementById('symptom').value.toLowerCase();
+      const suggestions = document.getElementById('suggestions');
+      suggestions.innerHTML = '';
+      if (!input) { suggestions.style.display = 'none'; return; }
+
+      const filtered = allSymptoms.filter(s => s.toLowerCase().includes(input)).slice(0, 15);
+      filtered.forEach(s => {
+        const div = document.createElement('div');
+        div.textContent = prettify(s);
+        div.onclick = () => { addSymptom(s); suggestions.style.display = 'none'; };
+        suggestions.appendChild(div);
+      });
+      suggestions.style.display = filtered.length ? 'block' : 'none';
+    }
+
+    function handleEnter(e) {
+      if (e.key === 'Enter') addSymptom();
+    }
+
+    function addSymptom(symptom) {
+      if (!symptom) symptom = document.getElementById('symptom').value.trim();
+      if (symptom && !selected.includes(symptom)) {
+        selected.push(symptom);
+        updateSelectedList();
+      }
+      document.getElementById('symptom').value = '';
+      document.getElementById('suggestions').style.display = 'none';
+    }
+
+    function removeSymptom(symptom) {
+      selected = selected.filter(s => s !== symptom);
+      updateSelectedList();
+    }
+
+    function updateSelectedList() {
+      const list = document.getElementById('selected');
+      list.innerHTML = '';
+      selected.forEach(s => {
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${prettify(s)}</span><button class="remove-btn" onclick="removeSymptom('${s}')">✕</button>`;
+        list.appendChild(li);
+      });
+      document.getElementById('count').textContent = selected.length;
+    }
+
+    function resetSymptoms() {
+      selected = [];
+      updateSelectedList();
+      document.getElementById('output').innerHTML = '';
+    }
+
+    async function predict() {
+      if (selected.length < 2) {
+        alert('Please select at least 2 symptoms.');
+        return;
+      }
+
+      document.getElementById('output').innerHTML = '<p>🔄 Analyzing symptoms...</p>';
+
+      try {
+        const response = await fetch('/predict', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symptoms: selected })
+        });
+        const data = await response.json();
+        displayResults(data);
+      } catch (error) {
+        document.getElementById('output').innerHTML = `<p style="color:red;">❌ Error: ${error.message}</p>`;
+      }
+    }
+
+    function displayResults(data) {
+      let html = '<h3>🎯 Predicted Diseases:</h3>';
+      data.predictions.forEach((p, index) => {
+        const diseaseId = `disease-${index}`;
+        const cureId = `cure-${index}`;
+        html += `
+          <div class="disease-item">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <strong>${prettify(p[0])}</strong> — ${p[1].toFixed(2)}%
+              </div>
+              <button class="btn-cure" onclick="getCure('${p[0]}', '${cureId}')">
+                💊 Get Treatment Info
+              </button>
+            </div>
+            <div id="${cureId}" class="cure-section"></div>
+          </div>
+        `;
+      });
+      html += `<p><strong>✅ Recognized:</strong> ${data.recognized.map(prettify).join(', ')}</p>`;
+      if (data.unrecognized.length > 0) {
+        html += `<p style="color:#ff6b6b;"><strong>⚠️ Unrecognized:</strong> ${data.unrecognized.map(prettify).join(', ')}</p>`;
+      }
+      document.getElementById('output').innerHTML = html;
+    }
+
+    async function getCure(disease, cureId) {
+      const cureDiv = document.getElementById(cureId);
+
+      if (cureDiv.style.display === 'block') {
+        cureDiv.style.display = 'none';
+        return;
+      }
+
+      cureDiv.innerHTML = '<div class="spinner"></div> Fetching treatment information...';
+      cureDiv.style.display = 'block';
+
+      try {
+        const response = await fetch('/get_cure', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disease: disease })
+        });
+        const data = await response.json();
+        cureDiv.innerHTML = data.cure;
+      } catch (error) {
+        cureDiv.innerHTML = `<p style="color:red;">Error fetching treatment info.</p>`;
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    return render_template_string(home_html, symptom_list=valid_symptoms)
+
+@app.route('/predict', methods=['POST'])
+def predict_api():
+    data = request.get_json()
+    symptoms = data.get('symptoms', [])
+    preds, recognized, unrecognized = predict_disease(symptoms)
+    return jsonify({'predictions': preds, 'recognized': recognized, 'unrecognized': unrecognized})
+
+@app.route('/get_cure', methods=['POST'])
+def get_cure_api():
+    data = request.get_json()
+    disease = data.get('disease', '')
+    cure_info = get_cure_from_gemini(disease)
+    return jsonify({'cure': cure_info})
+
+# ============================================
+# STEP 9: LAUNCH WEB APP
+# ============================================
+print("🚀 Launching web application...")
+ngrok.set_auth_token("YOUR TOKEN HERE")
+public_url = ngrok.connect(5000).public_url
+print(f"🌐 Your app is live at: {public_url}")
+
+app.run(port=5000, debug=True, use_reloader=False)
