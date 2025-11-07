@@ -1,0 +1,384 @@
+# ============================================
+# STEP 1: INSTALL REQUIRED PACKAGES
+# ============================================
+!pip install flask pyngrok scikit-learn pandas numpy joblib xgboost matplotlib
+
+# ============================================
+# STEP 2: IMPORT LIBRARIES
+# ============================================
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from flask import Flask, request, jsonify, render_template_string
+from pyngrok import ngrok
+import joblib
+import matplotlib.pyplot as plt
+!pip install --upgrade xgboost
+
+
+# Progress tracking function
+def print_status(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+# ============================================
+# STEP 3: LOAD MENDELEY DATASET
+# ============================================
+print_status("📂 STEP 1/10: Loading Dataset from Drive")
+DATASET_PATH = '/content/drive/MyDrive/Disease_and_symptoms_dataset.csv'
+
+try:
+    df = pd.read_csv(DATASET_PATH)
+    print_status(f"✅ Dataset loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+except Exception as e:
+    print_status(f"❌ Error loading dataset: {e}")
+    raise
+
+y = df.iloc[:, 0]
+X = df.iloc[:, 1:]
+
+valid_symptoms = [s.strip().lower().replace(" ", "_") for s in X.columns]
+X.columns = valid_symptoms
+print_status(f"✅ Processed {len(valid_symptoms)} symptom columns")
+
+# ============================================
+# STEP 4: HANDLE RARE CLASSES
+# ============================================
+print_status("🔍 STEP 2/10: Filtering Rare Diseases")
+disease_counts = y.value_counts()
+print(f"\n📊 Original dataset: {len(disease_counts)} unique diseases")
+print(f"Diseases with only 1 sample: {(disease_counts == 1).sum()}")
+
+rare_diseases = disease_counts[disease_counts < 2].index
+if len(rare_diseases) > 0:
+    print_status(f"⚠️ Removing {len(rare_diseases)} diseases with < 2 samples")
+    mask = ~y.isin(rare_diseases)
+    X = X[mask]
+    y = y[mask]
+    print_status(f"✅ Filtered dataset: {len(y)} samples, {y.nunique()} diseases")
+
+# ============================================
+# STEP 5: ENCODE DISEASES AND BALANCE CLASSES
+# ============================================
+print_status("🔢 STEP 3/10: Encoding Classes and Computing Weights")
+encoder = LabelEncoder()
+y_encoded = encoder.fit_transform(y)
+
+class_weights_vals = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_encoded),
+    y=y_encoded
+)
+class_weight_dict = {i: w for i, w in zip(np.unique(y_encoded), class_weights_vals)}
+print_status(f"✅ Encoded {len(np.unique(y_encoded))} disease classes")
+
+# ============================================
+# STEP 6: TRAIN/TEST SPLIT
+# ============================================
+print_status("✂️ STEP 4/10: Splitting Train/Test Data")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+)
+print_status(f"✅ Train size: {len(X_train)}, Test size: {len(X_test)}")
+
+# ============================================
+# STEP 7: TRAIN OR LOAD MODELS
+# ============================================
+print_status("🤖 STEP 5/10: Checking for Existing Models")
+MODEL_PATH_RF = '/content/drive/MyDrive/rf_model.pkl'
+MODEL_PATH_XGB = '/content/drive/MyDrive/xgb_model.pkl'
+ENCODER_PATH = '/content/drive/MyDrive/encoder.pkl'
+
+if os.path.exists(MODEL_PATH_RF) and os.path.exists(MODEL_PATH_XGB) and os.path.exists(ENCODER_PATH):
+    print_status("🔄 Loading pre-trained models from Drive...")
+    model_rf = joblib.load(MODEL_PATH_RF)
+    model_xgb = joblib.load(MODEL_PATH_XGB)
+    encoder = joblib.load(ENCODER_PATH)
+    print_status("✅ Models loaded successfully!")
+else:
+    print_status("🔄 No existing models found. Starting training...")
+
+    # ========== RANDOM FOREST TRAINING ==========
+    print_status("🌲 STEP 6/10: Training Random Forest (this will show progress)")
+    model_rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=20,
+        min_samples_split=10,
+        max_features='sqrt',
+        class_weight=class_weight_dict,
+        random_state=42,
+        n_jobs=-1,
+        verbose=1  # Shows progress: [building tree X of 200]
+    )
+    model_rf.fit(X_train, y_train)
+    rf_accuracy = model_rf.score(X_test, y_test)
+    print_status(f"✅ Random Forest complete! Accuracy: {rf_accuracy:.4f}")
+
+    # ========== XGBOOST TRAINING (GPU OPTIMIZED) ==========
+    print_status("⚡ STEP 7/10: Training XGBoost with GPU acceleration")
+    print_status("   (You'll see boosting round updates below)")
+
+    sample_weight = np.array([class_weight_dict[y] for y in y_train])
+
+    # Try GPU first, fallback to CPU if GPU not available
+    try:
+        print_status("   Attempting to use GPU...")
+        model_xgb = XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method='gpu_hist',      # GPU acceleration
+            predictor='gpu_predictor',   # GPU prediction
+            random_state=42,
+            eval_metric='mlogloss',
+            verbosity=2  # Shows detailed progress
+        )
+
+        model_xgb.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+            eval_set=[(X_test, y_test)],
+        )
+        print_status("✅ XGBoost trained using GPU!")
+
+    except Exception as e:
+        print_status(f"⚠️ GPU not available ({str(e)}), falling back to CPU with 'hist' method")
+        model_xgb = XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method='hist',  # Fast CPU algorithm
+            random_state=42,
+            n_jobs=-1,
+            eval_metric='mlogloss',
+            verbosity=2
+        )
+
+        model_xgb.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+            eval_set=[(X_test, y_test)],
+        )
+        print_status("✅ XGBoost trained using CPU!")
+
+    xgb_accuracy = model_xgb.score(X_test, y_test)
+    print_status(f"✅ XGBoost complete! Accuracy: {xgb_accuracy:.4f}")
+
+    # ========== SAVE MODELS ==========
+    print_status("💾 STEP 8/10: Saving models to Drive")
+    joblib.dump(model_rf, MODEL_PATH_RF)
+    joblib.dump(model_xgb, MODEL_PATH_XGB)
+    joblib.dump(encoder, ENCODER_PATH)
+    print_status("✅ All models saved to Drive!")
+
+    # ========== FEATURE IMPORTANCE ==========
+    print_status("📊 STEP 9/10: Plotting Feature Importance")
+    feat_importances = pd.Series(model_rf.feature_importances_, index=valid_symptoms)
+    feat_importances.nlargest(15).plot(kind='barh', figsize=(8,6), title="Top 15 Important Symptoms")
+    plt.xlabel("Feature Importance")
+    plt.tight_layout()
+    plt.show()
+    print_status("✅ Feature importance plot generated")
+
+print_status("✅ All models ready for predictions!")
+
+# ============================================
+# STEP 8: ENSEMBLE PREDICTION FUNCTION
+# ============================================
+def predict_disease(symptom_list, use_ensemble=True):
+    data = [0] * len(valid_symptoms)
+    recognized, unrecognized = [], []
+
+    for s in symptom_list:
+        s_clean = s.strip().lower().replace(" ", "_")
+        if s_clean in valid_symptoms:
+            data[valid_symptoms.index(s_clean)] = 1
+            recognized.append(s_clean)
+        else:
+            unrecognized.append(s)
+
+    if len(recognized) < 2:
+        return [("⚠️ Please enter at least 2 valid symptoms", 0)], recognized, unrecognized
+
+    try:
+        df_in = pd.DataFrame([data], columns=valid_symptoms)
+
+        if use_ensemble:
+            probs_rf = model_rf.predict_proba(df_in)[0]
+            probs_xgb = model_xgb.predict_proba(df_in)[0]
+            probs = (probs_rf + probs_xgb) / 2
+        else:
+            probs = model_rf.predict_proba(df_in)[0]
+
+        diseases = encoder.inverse_transform(np.arange(len(probs)))
+        top_idx = np.argsort(probs)[-5:][::-1]
+        results = [(diseases[i], probs[i] * 100) for i in top_idx]
+
+        confidence = probs[top_idx[0]]
+        if confidence < 0.25:
+            results.insert(0, ("⚠️ Low confidence prediction - consider more symptoms", confidence * 100))
+
+        return results, recognized, unrecognized
+    except Exception as e:
+        return [(f"❌ Prediction error: {e}", 0)], recognized, unrecognized
+
+# ============================================
+# STEP 9: FLASK UI WITH IMPROVED INTERACTIVITY
+# ============================================
+print_status("🌐 STEP 10/10: Setting up Flask Web Application")
+
+app = Flask(__name__)
+
+home_html = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>🩺 AI Disease Predictor</title>
+  <style>
+    body{font-family:Arial, sans-serif;background:#f0f2f5;margin:0;padding:20px;}
+    .container{max-width:600px;margin:auto;background:white;padding:25px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);}
+    input,select,button{width:100%;padding:10px;margin:10px 0;border-radius:5px;border:1px solid #ccc;font-size:15px;}
+    button{background:#4CAF50;color:white;font-weight:bold;cursor:pointer;}
+    button:hover{background:#45a049;}
+    ul{list-style:none;padding:0;}
+    li{padding:8px;background:#e8f0fe;margin:5px 0;border-radius:4px;display:flex;justify-content:space-between;}
+    .remove-btn{background:#ff4444;color:white;border:none;padding:5px 10px;border-radius:3px;cursor:pointer;}
+    .disclaimer{background:#fff3cd;padding:10px;border:1px solid #ffeeba;border-radius:5px;}
+    .count{color:#666;font-size:14px;}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>🧠 AI Disease Predictor (Ensemble Model)</h2>
+    <div class="disclaimer">
+      <strong>⚠️ Disclaimer:</strong> This app is for educational use only. Not a substitute for medical diagnosis.
+    </div>
+
+    <label for="symptom">Select Symptoms:</label>
+    <input type="text" id="symptom" onkeyup="filterSymptoms()" onkeypress="handleEnter(event)" placeholder="Start typing a symptom...">
+    <div id="suggestions" style="max-height:150px;overflow-y:auto;border:1px solid #ddd;border-radius:5px;display:none;"></div>
+
+    <button onclick="addSymptom()">Add Symptom</button>
+    <button onclick="resetSymptoms()">Reset Symptoms</button>
+
+    <div>
+      <h4>Selected Symptoms: <span class="count" id="count">(0)</span></h4>
+      <ul id="selected"></ul>
+    </div>
+
+    <button onclick="predict()">Predict Disease</button>
+
+    <div id="output" class="results"></div>
+  </div>
+
+  <script>
+    const allSymptoms = {{symptom_list | safe}};
+    let selected = [];
+
+    function filterSymptoms(){
+      const input = document.getElementById('symptom').value.toLowerCase();
+      const suggestions = document.getElementById('suggestions');
+      suggestions.innerHTML = '';
+      if(!input){suggestions.style.display='none';return;}
+      const filtered = allSymptoms.filter(s => s.toLowerCase().includes(input)).slice(0,15);
+      if(filtered.length){
+        filtered.forEach(f=>{
+          const div=document.createElement('div');
+          div.textContent=f;
+          div.style.padding='5px';
+          div.style.cursor='pointer';
+          div.onclick=()=>{addSymptom(f);suggestions.style.display='none';};
+          suggestions.appendChild(div);
+        });
+        suggestions.style.display='block';
+      }else{
+        suggestions.style.display='none';
+      }
+    }
+
+    function handleEnter(event){
+      if(event.key==='Enter'){
+        addSymptom();
+      }
+    }
+
+    function addSymptom(val){
+      if(!val)val=document.getElementById('symptom').value.trim();
+      if(val && !selected.includes(val)){
+        selected.push(val);
+        updateSelectedList();
+      }
+      document.getElementById('symptom').value='';
+      document.getElementById('suggestions').style.display='none';
+    }
+
+    function removeSymptom(val){
+      selected = selected.filter(s => s !== val);
+      updateSelectedList();
+    }
+
+    function updateSelectedList(){
+      const list = document.getElementById('selected');
+      list.innerHTML = '';
+      selected.forEach(s=>{
+        const li=document.createElement('li');
+        li.innerHTML=`<span>${s}</span><button class="remove-btn" onclick="removeSymptom('${s}')">✕</button>`;
+        list.appendChild(li);
+      });
+      document.getElementById('count').textContent=`(${selected.length})`;
+    }
+
+    function resetSymptoms(){
+      selected = [];
+      updateSelectedList();
+      document.getElementById('output').innerHTML = '';
+    }
+
+    async function predict(){
+      if(selected.length<2){alert('Please select at least 2 symptoms.');return;}
+      document.getElementById('output').innerHTML='Analyzing...';
+      const res = await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symptoms:selected})});
+      const data = await res.json();
+      let html='<h3>Predicted Diseases:</h3><ul>';
+      data.predictions.forEach(p=>{html+=`<li><b>${p[0]}</b> — ${typeof p[1]==='number'?p[1].toFixed(2)+'%':p[1]}</li>`});
+      html+='</ul>';
+      html+=`<p><strong>Recognized:</strong> ${data.recognized.join(', ')}</p>`;
+      if(data.unrecognized.length)
+        html+=`<p style="color:#ff4444;"><strong>Unrecognized:</strong> ${data.unrecognized.join(', ')}</p>`;
+      document.getElementById('output').innerHTML=html;
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    return render_template_string(home_html, symptom_list=valid_symptoms)
+
+@app.route('/predict', methods=['POST'])
+def predict_api():
+    data = request.get_json()
+    symptoms = data.get('symptoms', [])
+    preds, recognized, unrecognized = predict_disease(symptoms)
+    return jsonify({'predictions': preds, 'recognized': recognized, 'unrecognized': unrecognized})
+
+# ============================================
+# STEP 10: LAUNCH APP WITH NGROK
+# ============================================
+print_status("🚀 Launching Flask app with ngrok tunnel")
+ngrok.set_auth_token("34Cu5ODz9aGgxoyKLrHOoCvRVrW_6k7qKQYKTfjxTn8uxP28S")
+public_url = ngrok.connect(5000).public_url
+print_status(f"🌐 Public App URL: {public_url}")
+print_status("✅ App is running! Visit the URL above to use the predictor")
+
+app.run(port=5000, debug=True, use_reloader=False)
